@@ -4,7 +4,7 @@ import json
 import sqlite3
 import sys
 from pathlib import Path
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, APIStatusError, APIConnectionError, APITimeoutError
 from dotenv import load_dotenv
 
 import tools
@@ -59,16 +59,22 @@ TOOLS = [
         "function": {
             "name": "telegram_send",
             "description": (
-                "Отправляет Саше сообщение прямо сейчас, посреди работы — не дожидаясь финального ответа. "
-                "Используй, когда есть что сказать по делу: нашёл проблему, нужно его решение, "
-                "или работа затянется и надо доложить промежуточный итог. "
-                "Не используй для отчётов «я начала делать X» и прочей воды: "
-                "он и так видит индикатор печати. Одна мысль — одно сообщение, коротко."
+                "Отправляет сообщение прямо сейчас. Это ЕДИНСТВЕННЫЙ способ ответить: "
+                "финальный текст твоего ответа в чат не доставляется, не вызвал инструмент = промолчал. "
+                "Кому адресовать: проставляй параметр name — ИМЯ получателя (например «Саша», "
+                "«Lera»): ID определится сам по базе пользователей, руками искать не нужно. "
+                "Если name не указан — пусто = тому, кто написал (обычный ответ собеседнику); "
+                "user_id остаётся запасным вариантом, когда имя неизвестно или неоднозначно. "
+                "Используй, когда есть что сказать по делу: нашёл проблему, нужен вердикт, "
+                "или работа затянется и надо доложить. "
+                "Одна мысль — одно сообщение, коротко."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "text": {"type": "string", "description": "Текст сообщения"}
+                    "text": {"type": "string", "description": "Текст сообщения"},
+                    "name": {"type": "string", "description": "Имя получателя (как он записан в базе). ID определится автоматически."},
+                    "user_id": {"type": "integer", "description": "ID получателя в Telegram. Запасной вариант, если имя неизвестно. Пусто = текущий собеседник."},
                 },
                 "required": ["text"],
             },
@@ -76,7 +82,23 @@ TOOLS = [
     }
 ] + tools.TOOLS_TOOLS
 
-ALWAYS_TOOLS = {"telegram_send"}
+ALWAYS_TOOLS = {"telegram_send"} | tools.ALWAYS_TOOL_NAMES
+
+# Инструменты поиска — под отдельным тумблером «Поиск»
+WEB_TOOLS = {"web_search", "web_fetch"}
+
+# Отказоустойчивость: сколько раз стучаться в API при 5xx/таймаутах/обрывах.
+MAX_API_RETRIES = 5
+RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504}
+
+
+def is_retryable(e: Exception) -> bool:
+    """503, таймауты, обрыв соединения — стучимся снова. Остальное (401, 400...) — нет."""
+    if isinstance(e, (APIConnectionError, APITimeoutError)):
+        return True
+    if isinstance(e, APIStatusError):
+        return e.status_code in RETRYABLE_STATUS
+    return False
 
 
 # --- Гибридная память (без лимитов) ---
@@ -225,7 +247,7 @@ async def run_command_async(command: str) -> str:
         return f"Ошибка выполнения: {e}"
 
 
-async def chat_with_agent(user_id: int, user_text: str, on_thinking_start=None, on_tool_call=None, on_text=None, thinking: bool = True, terminal: bool = False, send_message=None) -> str:
+async def chat_with_agent(user_id: int, user_text: str, on_thinking_start=None, on_tool_call=None, on_text=None, thinking: bool = True, terminal: bool = False, send_message=None, price: bool = False, search: bool = True) -> str:
     """
     Streaming цикл агента с гибридной памятью. Без лимитов итераций.
 
@@ -246,55 +268,99 @@ async def chat_with_agent(user_id: int, user_text: str, on_thinking_start=None, 
         history = get_history(user_id)
         messages = build_messages_with_cache(history)
 
+        # Напоминание о памяти: если пусто — подсказываем модели про инструменты.
+        # Мутируем КОПИЮ последнего сообщения, историю в БД не трогаем.
+        reminder = tools.memory_reminder(user_id)
+        if reminder and messages and messages[-1].get("role") == "user":
+            last = dict(messages[-1])
+            content = last.get("content", "")
+            if isinstance(content, str) and content:
+                last["content"] = f"{content}\n\n[system] {reminder}"
+                messages[-1] = last
+            elif isinstance(content, list) and content:
+                # content уже обёрнут в list кэш-блоками — дописываем свой text-блок
+                blocks = list(content)
+                blocks.append({"type": "text", "text": f"[system] {reminder}"})
+                last["content"] = blocks
+                messages[-1] = last
+
         # telegram_send — это мой голос, он доступен всегда.
         # Доступ к системе (терминал + файлы) — только при включённом тумблере.
-        active_tools = [t for t in TOOLS if t["function"]["name"] in ALWAYS_TOOLS]
+        # Собираем доступные инструменты по тумблерам.
+        # Поиск 🔴 прячет web_search/web_fetch у всех остальных наборов.
+        def _allowed(name: str) -> bool:
+            if name in WEB_TOOLS and not search:
+                return False
+            return True
+
+        active_tools = [t for t in TOOLS if t["function"]["name"] in ALWAYS_TOOLS and _allowed(t["function"]["name"])]
         if terminal:
-            active_tools += [t for t in TOOLS if t not in active_tools]
+            active_tools += [t for t in TOOLS if t not in active_tools and _allowed(t["function"]["name"])]
         req_kwargs = {"tools": active_tools, "tool_choice": "auto"}
 
-        stream = await client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=messages,
-            stream=True,
-            extra_body={"enable_thinking": bool(thinking), "provider": {"sort": "price"}},
-            **req_kwargs,
-        )
+        # Провайдер: price = сортировка по цене (дешёвый),
+        # иначе дефолт провайдера — минимальная задержка.
+        extra_body = {"enable_thinking": bool(thinking)}
+        if price:
+            extra_body["provider"] = {"sort": "price"}
 
-        content_parts = []
-        tool_calls_data = {}
+        # Отказоустойчивость: 503/таймаут/обрыв стрима — стучимся снова
+        # с экспоненциальной задержкой, частично полученные чанки выбрасываем.
+        attempt = 0
+        while True:
+            content_parts = []
+            tool_calls_data = {}
+            try:
+                stream = await client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=messages,
+                    stream=True,
+                    extra_body=extra_body,
+                    **req_kwargs,
+                )
 
-        async for chunk in stream:
-            delta = chunk.choices[0].delta
+                async for chunk in stream:
+                    delta = chunk.choices[0].delta
 
-            # reasoning прилетает раньше обычного текста — считаем его началом раздумья
-            reasoning_chunk = getattr(delta, "reasoning", None)
-            if not thinking_started and isinstance(reasoning_chunk, str) and reasoning_chunk:
-                thinking_started = True
+                    # reasoning прилетает раньше обычного текста — считаем его началом раздумья
+                    reasoning_chunk = getattr(delta, "reasoning", None)
+                    if not thinking_started and isinstance(reasoning_chunk, str) and reasoning_chunk:
+                        thinking_started = True
+                        if on_thinking_start:
+                            await on_thinking_start()
+
+                    # Первый chunk с контентом или tool_calls = модель начала думать
+                    if not thinking_started and (delta.content or delta.tool_calls):
+                        thinking_started = True
+                        if on_thinking_start:
+                            await on_thinking_start()
+
+                    if delta.content:
+                        content_parts.append(delta.content)
+
+                    if delta.tool_calls:
+                        for tc_delta in delta.tool_calls:
+                            idx = tc_delta.index
+                            if idx not in tool_calls_data:
+                                tool_calls_data[idx] = {"id": "", "name": "", "arguments": ""}
+                            if tc_delta.id:
+                                tool_calls_data[idx]["id"] = tc_delta.id
+                            if tc_delta.function:
+                                if tc_delta.function.name:
+                                    tool_calls_data[idx]["name"] = tc_delta.function.name
+                                if tc_delta.function.arguments:
+                                    tool_calls_data[idx]["arguments"] += tc_delta.function.arguments
+                break  # стрим дочитан без ошибок
+            except Exception as e:
+                if not is_retryable(e) or attempt >= MAX_API_RETRIES:
+                    raise
+                attempt += 1
+                delay = min(2 ** attempt, 20)  # 2, 4, 8, 16, 20 сек
+                print(f"[retry] API сбой ({type(e).__name__}: {e}) — "
+                      f"попытка {attempt}/{MAX_API_RETRIES}, жду {delay}s", flush=True)
                 if on_thinking_start:
                     await on_thinking_start()
-
-            # Первый chunk с контентом или tool_calls = модель начала думать
-            if not thinking_started and (delta.content or delta.tool_calls):
-                thinking_started = True
-                if on_thinking_start:
-                    await on_thinking_start()
-
-            if delta.content:
-                content_parts.append(delta.content)
-
-            if delta.tool_calls:
-                for tc_delta in delta.tool_calls:
-                    idx = tc_delta.index
-                    if idx not in tool_calls_data:
-                        tool_calls_data[idx] = {"id": "", "name": "", "arguments": ""}
-                    if tc_delta.id:
-                        tool_calls_data[idx]["id"] = tc_delta.id
-                    if tc_delta.function:
-                        if tc_delta.function.name:
-                            tool_calls_data[idx]["name"] = tc_delta.function.name
-                        if tc_delta.function.arguments:
-                            tool_calls_data[idx]["arguments"] += tc_delta.function.arguments
+                await asyncio.sleep(delay)
 
         final_content = "".join(content_parts)
 
@@ -347,9 +413,20 @@ async def chat_with_agent(user_id: int, user_text: str, on_thinking_start=None, 
                     tool_result = "Канал отправки не подключён."
                 else:
                     try:
-                        tool_result = await send_message(args.get("text", ""))
+                        tool_result = await send_message(
+                            args.get("text", ""), args.get("user_id"), args.get("name")
+                        )
                     except Exception as e:
                         tool_result = f"Не отправил: {type(e).__name__}: {e}"
+            elif name in tools.ALWAYS_TOOL_NAMES:
+                # «Мозги» агента: память, интернет, напоминания — доступны всегда,
+                # это не серверные команды, а функции самого агента.
+                try:
+                    tool_result = await asyncio.to_thread(tools.DISPATCH[name], **args)
+                except TypeError as e:
+                    tool_result = f"Неверные аргументы для {name}: {e}"
+                except Exception as e:
+                    tool_result = f"Ошибка {name}: {type(e).__name__}: {e}"
             elif name in tools.DISPATCH:
                 # Файловые инструменты под тем же тумблером, что и терминал:
                 # иначе это обход блокировки, а не инструмент.
