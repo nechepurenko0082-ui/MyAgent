@@ -8,8 +8,9 @@ systemd user service.
 
 ## What it does
 
-- **Telegram bot** — owner gets answers through the agent's own `telegram_send`
-  tool; regular users get a simple "one question — one answer" contract.
+- **Telegram bot** — the owner's replies are delivered automatically as the final
+  text; `telegram_send` is for addressing someone else by name. Regular users get
+  a simple "one question — one answer" contract.
 - **Agent loop** — reasoning model with tool calling, retry/resilience on 5xx and
   timeouts, hybrid history (SQLite + in-memory cache).
 - **Server access** — `run_command` (bash), file tools (`read_file`, `edit_file`,

@@ -115,35 +115,56 @@ def read_file(path: str, start_line=None, end_line=None) -> str:
     if not p.is_file():
         return _err(f"не файл: {p}")
 
-    size = p.stat().st_size
-    if size > MAX_READ_BYTES:
-        return _err(f"файл {size} байт, лимит {MAX_READ_BYTES}. Используй start_line/end_line.")
-
-    try:
-        text = p.read_text(encoding="utf-8", errors="replace")
-    except Exception as exc:
-        return _err(f"не прочитал: {exc}")
-
-    lines = text.splitlines()
-    total = len(lines)
-
     try:
         start = int(start_line) if start_line else 1
     except (TypeError, ValueError):
         start = 1
     try:
-        end = int(end_line) if end_line else total
+        end = int(end_line) if end_line else None
     except (TypeError, ValueError):
-        end = total
+        end = None
+
+    size = p.stat().st_size
+    if size > MAX_READ_BYTES and end is None:
+        # Без диапазона большой файл читать бессмысленно (и опасно по памяти).
+        # С диапазоном — читаем: вывод всё равно ограничен MAX_READ_BYTES_OUT.
+        return _err(
+            f"файл {size} байт, лимит {MAX_READ_BYTES}. "
+            "Укажи start_line/end_line — тогда прочитаю нужный кусок."
+        )
+
+    truncated_range = False
+    big_file = size > MAX_READ_BYTES
+    if big_file:
+        # Большой файл не грузим целиком: один проход, в память — только диапазон.
+        start = max(1, start)
+        lines = []
+        total = 0
+        with p.open(encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh, 1):
+                total = i
+                if start <= i <= end:
+                    if len(lines) < 20_000:
+                        lines.append(line.rstrip("\n"))
+                    else:
+                        truncated_range = True
+    else:
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            return _err(f"не прочитал: {exc}")
+        lines = text.splitlines()
+        total = len(lines)
 
     start = max(1, start)
-    end = min(total, end)
+    end = total if end is None else min(total, end)
     if start > end:
         return _err(f"start_line {start} > end_line {end}")
 
     # Режем по байтам, но строго по границам строк: обрубленная посередине
     # строка хуже лимита — она выглядит как конец файла.
-    chunk = lines[start - 1:end]
+    # В большой ветке lines уже начинается с start — там срез иной.
+    chunk = lines[:end - start + 1] if big_file else lines[start - 1:end]
     width = len(str(end))
     out, shown, used = [], 0, 0
     for i, line in enumerate(chunk, start):
@@ -156,7 +177,7 @@ def read_file(path: str, start_line=None, end_line=None) -> str:
 
     last_shown = start + shown - 1
     head = f"{p} | строк всего: {total} | показано {start}-{last_shown}"
-    if last_shown < end:
+    if last_shown < end or truncated_range:
         head += f" | ОБРЕЗАНО, продолжение: start_line={last_shown + 1}"
     return head + "\n" + "\n".join(out)
 
@@ -468,6 +489,14 @@ def web_search(query: str, limit: int = 5) -> str:
         results.append((title, url, snippet))
 
     if not results:
+        # Различаем «вопрос пуст» и «парсер сломался»: если DDG вернул страницу
+        # в неожиданной вёрстке (нет result-link), молчать нельзя — иначе
+        # хрупкий regex превращается в тихий отказ поиска.
+        if "result-link" not in body:
+            return (
+                f"Поиск не разобрал страницу DDG (вёрстка изменилась?) — "
+                f"результаты не извлечены. Это СБОЙ парсера, а не «ничего нет»."
+            )
         return f"По запросу «{query}» ничего не нашлось."
     out = [f"Результаты поиска: «{query}»"]
     for i, (title, url, snippet) in enumerate(results, 1):
@@ -485,10 +514,16 @@ def web_fetch(url: str, max_chars: int = 6000) -> str:
     except (TypeError, ValueError):
         max_chars = 6000
     req = urllib.request.Request(url, headers=_UA)
+    # Ответ читаем с потолком: гигабайтная страница не должна съесть RAM сервера.
+    max_fetch_bytes = 4_000_000
     try:
-        raw = urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT).read()
+        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
+            raw = resp.read(max_fetch_bytes + 1)
     except Exception as e:
         return f"Не открыл {url}: {type(e).__name__}: {e}"
+    fetch_truncated = len(raw) > max_fetch_bytes
+    if fetch_truncated:
+        raw = raw[:max_fetch_bytes]
 
     text = raw.decode("utf-8", "replace")
     # Выкидываем скрипты/стили, собираем текст
@@ -504,6 +539,8 @@ def web_fetch(url: str, max_chars: int = 6000) -> str:
         return f"Страница {url} пустая или только скрипты."
     if len(text) > max_chars:
         text = text[:max_chars] + "\n...[текст обрезан]"
+    if fetch_truncated:
+        text += "\n...[исходная страница больше лимита чтения — обрезана по байтам]"
     return f"{url}\n{text}"
 
 

@@ -5,6 +5,7 @@ import re
 import sqlite3
 import time
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, Router, types
@@ -22,7 +23,7 @@ ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID"))
 if not BOT_TOKEN or not ALLOWED_USER_ID:
     raise ValueError("BOT_TOKEN и ALLOWED_USER_ID должны быть в .env")
 
-DB_PATH = "user_states.db"
+DB_PATH = str(Path(__file__).resolve().parent / "user_states.db")
 
 # Очередь входящих: бот принимает всё подряд, агент разбирает по одному.
 # Новое сообщение больше не отменяет текущую работу — она продолжается.
@@ -503,10 +504,14 @@ async def agent_task(bot: Bot, chat_id: int, user_id: int, text: str, state: dic
             except OSError:
                 pass
 
+    sent_to_owner = {"done": False}
+
     async def send_message(text, user_id=None, name=None):
         """
         Мост для telegram_send: инструмент строго для владельца.
         name — имя получателя, ID определяется автоматически по базе users.
+        Отметка sent_to_owner нужна, чтобы финальный текст не дублировал
+        то, что уже ушло адресно через инструмент.
         """
         if chat_id != ALLOWED_USER_ID:
             return (
@@ -529,9 +534,13 @@ async def agent_task(bot: Bot, chat_id: int, user_id: int, text: str, state: dic
         elif user_id:
             target = int(user_id)
         if state.get("speech") and await _speak(target, text):
+            if target == ALLOWED_USER_ID:
+                sent_to_owner["done"] = True
             return f"Голосовое отправлено в {target}."
         try:
             await deliver(bot, target, text)
+            if target == ALLOWED_USER_ID:
+                sent_to_owner["done"] = True
             return f"Отправлено в {target}."
         except Exception as e:
             return f"Не отправлено: {e}"
@@ -555,17 +564,16 @@ async def agent_task(bot: Bot, chat_id: int, user_id: int, text: str, state: dic
 
         await _stop_typing()
 
-        if chat_id == ALLOWED_USER_ID:
-            # Владелец: ответ только через telegram_send, финальный текст логируем.
-            if final_reply.strip():
-                print(f"[agent] молчал (без telegram_send): {final_reply[:300]}", flush=True)
+        if final_reply.strip():
+            if chat_id == ALLOWED_USER_ID and sent_to_owner["done"]:
+                # Уже ушло адресно через telegram_send — финал не дублируем.
+                print(f"[agent] финал шёл через telegram_send: {final_reply[:300]}", flush=True)
+            elif not (state.get("speech") and await _speak(chat_id, final_reply)):
+                # Новый контракт: финальный текст доставляется автоматически
+                # (владелецу и пользователям одинаково).
+                await deliver(bot, chat_id, final_reply)
         else:
-            # Пользователь: один вопрос — один ответ, автоматически, откуда пришёл.
-            if final_reply.strip():
-                if not (state.get("speech") and await _speak(chat_id, final_reply)):
-                    await deliver(bot, chat_id, final_reply)
-            else:
-                print(f"[agent] пустой ответ пользователю {chat_id}", flush=True)
+            print(f"[agent] пустой финальный ответ chat={chat_id}", flush=True)
 
     except asyncio.CancelledError:
         await _stop_typing()
@@ -809,6 +817,18 @@ async def reminder_loop(bot: Bot):
             now_iso = _dt.now(ZoneInfo("Europe/Moscow")).replace(second=0, microsecond=0).strftime("%Y-%m-%d %H:%M")
             for rid, chat_id, text in tools.reminders_due(now_iso):
                 target = chat_id or ALLOWED_USER_ID
+                allowed = True
+                if target != ALLOWED_USER_ID:
+                    # Напоминание не обходит регистрацию и тумблер «Пользователи»
+                    u = get_user(target)
+                    if u is None or u["status"] != "approved":
+                        allowed = False
+                    elif not effective_state(target).get("users", True):
+                        allowed = False
+                if not allowed:
+                    print(f"[reminder] пропустил #{rid}: получатель {target} не в доступе", flush=True)
+                    tools.reminders_forget(rid)
+                    continue
                 try:
                     await deliver(bot, target, f"⏰ Напоминание: {text}")
                 except Exception as e:
