@@ -1,8 +1,22 @@
 # секреты и личное
 .env
 system_prompt.txt
+system_prompt.javis.txt
 
-# базы
+# секреты remote (токены, ключи, состояние)
+remote/token.txt
+remote/legacy_token.txt
+remote/*.pem
+remote/state.json
+remote/client.ps1
+remote/notify.ps1
+remote/install.ps1
+remote/client.py
+
+# логи
+*.log
+
+# базы (переписка, память, состояния пользователей)
 *.db
 *.db-journal
 *.db-wal
@@ -14,8 +28,10 @@ __pycache__/
 venv/
 .venv/
 
-# бэкапы
+# бэкапы и мусор
 backups/
+*.bak
+*.tmp
 
 # бинарники
 bin/

@@ -246,7 +246,7 @@ async def run_command_async(command: str) -> str:
         return f"Ошибка выполнения: {e}"
 
 
-async def chat_with_agent(user_id: int, user_text: str, on_thinking_start=None, on_tool_call=None, on_text=None, thinking: bool = True, terminal: bool = False, send_message=None, price: bool = False, search: bool = True) -> str:
+async def chat_with_agent(user_id: int, user_text: str, on_thinking_start=None, on_tool_call=None, on_text=None, thinking: bool = True, terminal: bool = False, send_message=None, price: bool = False, search: bool = True, users: bool = True) -> str:
     """
     Streaming цикл агента с гибридной памятью. Без лимитов итераций.
 
@@ -388,6 +388,8 @@ async def chat_with_agent(user_id: int, user_text: str, on_thinking_start=None, 
         if final_content.strip() and tool_calls_data and on_text:
             await on_text(final_content)
         # Обрабатываем tool_calls
+        # Лимит telegram_send: не больше одного за шаг (за одну итерацию цикла).
+        send_used = 0
         for idx in sorted(tool_calls_data.keys()):
             tc_data = tool_calls_data[idx]
             name = tc_data["name"]
@@ -408,9 +410,23 @@ async def chat_with_agent(user_id: int, user_text: str, on_thinking_start=None, 
                 else:
                     tool_result = await run_command_async(command)
             elif name == "telegram_send":
-                if send_message is None:
+                # Жёсткие ограничения на уровне кода, а не промпт:
+                # 1) тумблер «Пользователи» 🔴 = вызов не проходит;
+                # 2) максимум один вызов за шаг.
+                if not users:
+                    tool_result = (
+                        "ЗАПРЕЩЕНО: тумблер «Пользователи» 🔴 — telegram_send "
+                        "заблокирован, пока не будет 🟢."
+                    )
+                elif send_used >= 1:
+                    tool_result = (
+                        "Лимит: не больше одного telegram_send за шаг. "
+                        "Второй вызов в этой итерации не отправлен."
+                    )
+                elif send_message is None:
                     tool_result = "Канал отправки не подключён."
                 else:
+                    send_used += 1
                     try:
                         tool_result = await send_message(
                             args.get("text", ""), args.get("user_id"), args.get("name")

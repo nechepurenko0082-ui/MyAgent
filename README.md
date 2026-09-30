@@ -94,6 +94,11 @@ bin/ffmpeg         # local static ffmpeg copy (git-ignored)
 - `.env`, databases, backups and `system_prompt.txt` are git-ignored.
 - `telegram_send` is owner-only; destructive requests are refused for everyone.
 - The terminal is hard-wired to the owner account.
+- `remote/` secrets (tokens, TLS key/cert, client files with embedded tokens) are
+  git-ignored. Clients are built from `remote/templates/*.tpl` by
+  `remote/gen_clients.py` — templates contain placeholders only.
+- Remote PC channel: TLS 1.2 with certificate pinning (SHA-256). Plain HTTP is
+  kept only as a legacy bootstrap bridge; rotated tokens work there only.
 
 ## License
 

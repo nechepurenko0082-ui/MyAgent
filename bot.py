@@ -153,7 +153,22 @@ def user_label(user_id):
 _OWNER_ALIASES = {"саша", "sasha", "alexander", "создатель", "владелец", "owner"}
 
 # Алиасы реальных имён участников (в базе они под другими именами)
-_NAME_ALIASES = {"валерия": 7149179290, "лера": 7149179290}
+# Алиасы имён -> user_id берутся из .env (USER_ALIASES="имя:id,имя:id"),
+# чтобы личные данные не попадали в репозиторий.
+def _load_name_aliases():
+    out = {}
+    for part in (os.getenv("USER_ALIASES") or "").split(","):
+        part = part.strip()
+        if ":" in part:
+            name, uid = part.rsplit(":", 1)
+            try:
+                out[name.strip().lower()] = int(uid.strip())
+            except ValueError:
+                pass
+    return out
+
+
+_NAME_ALIASES = _load_name_aliases()
 
 
 def resolve_user_by_name(name):
@@ -391,11 +406,12 @@ def build_context_message(user_text: str, state: dict, user_id: int) -> str:
     users = "🟢" if state.get("users", True) else "🔴"
     search = "🟢" if state.get("search", True) else "🔴"
     speech = "🟢" if state.get("speech", False) else "🔴"
-    who = f"{user_label(user_id)} ({user_id})"
+    # Имя без ID: «Alexander:». ID есть в системе (user_id), но в текст не выводим.
+    who = f"{user_label(user_id)}:"
     return (
         f"{time_str}.\n"
         f"{thinking} Мышление | {terminal} Терминал | {users} Пользователи | {search} Поиск | {speech} Голос\n"
-        f"{who}\n\n{user_text}"
+        f"{who}\n{user_text}"
     )
 
 
@@ -518,6 +534,13 @@ async def agent_task(bot: Bot, chat_id: int, user_id: int, text: str, state: dic
                 "ЗАПРЕЩЕНО: telegram_send — только для владельца. "
                 "Пользователям ответ уходит автоматически."
             )
+        # Тумблер «Пользователи» 🔴 — жёсткая блокировка на уровне кода,
+        # а не просьба не пользоваться: вызов просто не пройдёт.
+        if not state.get("users", True):
+            return (
+                "ЗАПРЕЩЕНО: тумблер «Пользователи» 🔴 — telegram_send "
+                "заблокирован, пока не будет 🟢."
+            )
         if not text or not text.strip():
             return "Пустое сообщение не отправлено."
         target = chat_id
@@ -560,6 +583,7 @@ async def agent_task(bot: Bot, chat_id: int, user_id: int, text: str, state: dic
             price=state.get("price", False),
             search=state.get("search", True),
             send_message=send_message,
+            users=state.get("users", True),
         )
 
         await _stop_typing()
@@ -816,23 +840,15 @@ async def reminder_loop(bot: Bot):
         try:
             now_iso = _dt.now(ZoneInfo("Europe/Moscow")).replace(second=0, microsecond=0).strftime("%Y-%m-%d %H:%M")
             for rid, chat_id, text in tools.reminders_due(now_iso):
-                target = chat_id or ALLOWED_USER_ID
-                allowed = True
-                if target != ALLOWED_USER_ID:
-                    # Напоминание не обходит регистрацию и тумблер «Пользователи»
-                    u = get_user(target)
-                    if u is None or u["status"] != "approved":
-                        allowed = False
-                    elif not effective_state(target).get("users", True):
-                        allowed = False
-                if not allowed:
-                    print(f"[reminder] пропустил #{rid}: получатель {target} не в доступе", flush=True)
-                    tools.reminders_forget(rid)
-                    continue
+                # Все напоминания приходят только владельцу и ими управляет только он.
                 try:
-                    await deliver(bot, target, f"⏰ Напоминание: {text}")
+                    await deliver(bot, ALLOWED_USER_ID, f"⏰ Напоминание: {text}")
                 except Exception as e:
-                    print(f"[reminder] не доставил #{rid}: {e}", flush=True)
+                    # Ошибка доставки НЕ удаляет напоминание: остаётся в БД
+                    # и повторится на следующем круге (каждые 30 секунд),
+                    # пока доставка не пройдёт успешно.
+                    print(f"[reminder] не доставил #{rid}: {e} — повтор позже", flush=True)
+                    continue
                 tools.reminders_forget(rid)
         except Exception as e:
             print(f"[reminder] ошибка планировщика: {e}", flush=True)
