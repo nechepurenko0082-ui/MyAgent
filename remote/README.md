@@ -1,74 +1,79 @@
-# Freyd Remote — управление ПК Саши с сервера (TLS)
+# Freyd Remote — controlling Sasha's PC from the server (TLS)
 
-## Схема
+Русский: [README.ru.md](README.ru.md)
+
+## Architecture
 
 ```
-Саша/Фрайд             Сервер (server.py)                ПК Саши (Windows)
-     │  команда в очередь    │                                │
+Sasha/Freyd              server (server.py)                Sasha's PC (Windows)
+     │  command to queue     │                                │
      │ ────────────────────► │                                │
-     │                       │ ◄── клиент стучится сам ────── │ (исходящий HTTPS)
-     │                       │ ── отдаёт команду ───────────► │
-     │                       │ ◄── выполняет, шлёт вывод ──── │
+     │                       │ ◄── client dials in ────────── │ (outgoing HTTPS)
+     │                       │ ── delivers command ─────────► │
+     │                       │ ◄── runs it, sends output ──── │
      │ ◄── ctl.py ────────── │                                │
 ```
 
-## Каналы
+## Channels
 
-| Порт | Что | Зачем |
+| Port | What | Purpose |
 |---|---|---|
-| **8443** | HTTPS (TLS 1.2, самоподписанный серт) | Рабочий канал клиента. Шифрование + **пиннинг** сертификата |
-| 8093 | plain HTTP | **Legacy-мост**: только bootstrap старых клиентов. Отдаёт команду самообновления на TLS. Потом можно закрыть |
+| **8443** | HTTPS (TLS 1.2, self-signed cert) | Working client channel. Encryption + certificate **pinning** |
+| 8093 | plain HTTP | **Legacy bridge**: bootstrap for old clients only. Returns the self-update command, then can be closed |
 
-Провайдер видит только шифрованный поток между IP (содержимое команд, вывод и токен скрыты).
-Факт «между этими IP идёт трафик» и его объёмы TLS не прячет — для этого нужен VPN/Tor.
+The ISP only sees an encrypted stream between the two IPs (commands, output and
+token stay hidden). TLS does not hide the fact that traffic flows between these
+IPs or its volume — that would need a VPN/Tor.
 
-## Шифрование
+## Encryption
 
-- Сертификат: `remote/cert.pem` + `remote/key.pem`, самоподписанный, 10 лет.
+- Certificate: `remote/cert.pem` + `remote/key.pem`, self-signed, 10 years.
   SAN: IP:5.129.212.74, IP:127.0.0.1, DNS:localhost.
-- **Пиннинг**: клиенты (client.ps1, notify.ps1) принимают ТОЛЬКО серт с нашим
-  SHA256-отпечатком (зашит в `$CertFp`). Подмена серта = отказ соединения.
-- Отпечаток посмотреть: `openssl x509 -in remote/cert.pem -noout -fingerprint -sha256`
-- Ротация серта: сгенерировать новый, прописать новый `$CertFp` в client.ps1 и
-  notify.ps1 — клиенты подтянут их самообновлением (см. ниже).
+- **Pinning**: clients (client.ps1, notify.ps1) accept ONLY the cert with our
+  SHA-256 fingerprint (hardcoded as `$CertFp`). A substituted cert = connection
+  refused.
+- Show fingerprint: `openssl x509 -in remote/cert.pem -noout -fingerprint -sha256`
+- Rotating the cert: generate a new one, put the new `$CertFp` into client.ps1
+  and notify.ps1 — clients pick them up via self-update (see below).
 
-## Самообновление клиента
+## Client self-update
 
-1. **Legacy**: старый клиент стучится на :8093 → сервер сразу отдаёт команду
-   bootstrap (скачать новые client.ps1/notify.ps1/update.ps1 с :8443).
-   Целостность — сверка SHA256 внутри update.ps1.
-2. **TLS**: новый клиент при каждом старте сверяет SHA256 своих файлов с сервером
-   (`GET /api/client_meta?h_client=..&h_notify=..`). Расхождение → сам стягивает
-   файлы, проверяет хэши, перезапускается через update.ps1.
+1. **Legacy**: an old client dials :8093 → the server immediately returns a
+   bootstrap command (download new client.ps1/notify.ps1/update.ps1 from :8443).
+   Integrity is checked by SHA256 inside update.ps1.
+2. **TLS**: the new client checks its own file hashes against the server on every
+   start (`GET /api/client_meta?h_client=..&h_notify=..`). Any mismatch → it
+   downloads the files, verifies hashes and restarts itself via update.ps1.
 
-То есть для обновления достаточно положить новый client.ps1 в `remote/` —
-все клиенты подтянут сами при следующем старте/переподключении.
+So to roll out an update, just drop a new client.ps1 into `remote/` — all
+clients pick it up at next start/reconnect.
 
-## Файлы
+## Files
 
-| Файл | Что делает |
+| File | Purpose |
 |---|---|
-| `server.py` | HTTPS :8443 (рабочий) + HTTP :8093 (legacy-мост) |
-| `start_remote.sh` | Перезапуск сервера |
-| `remote/client.ps1` | Клиент для ПК (TLS + пиннинг + самообновление) |
-| `remote/notify.ps1` | Уведомления о выключении/перезагрузке (event 1074) |
-| `remote/client.py` | Python-вариант клиента |
-| `remote/install.ps1` | Установка на ПК: задачи планировщика FreydClient + FreydNotify |
-| `remote/ctl.py` | `python3 remote/ctl.py "команда"` → вывод с ПК |
-| `remote/token.txt` | Токен (X-Token, обязателен везде) |
-| `remote/cert.pem`, `remote/key.pem` | TLS-сертификат |
+| `server.py` | HTTPS :8443 (working) + HTTP :8093 (legacy bridge) |
+| `start_remote.sh` | Restart the server |
+| `remote/client.ps1` | Windows client (TLS + pinning + self-update) |
+| `remote/notify.ps1` | Shutdown/restart notifications (event 1074) |
+| `remote/client.py` | Python variant of the client |
+| `remote/install.ps1` | Installer: scheduled tasks FreydClient + FreydNotify |
+| `remote/gen_clients.py` | Builds clients from `templates/*.tpl` with real secrets |
+| `remote/ctl.py` | `python3 remote/ctl.py "command"` → output from the PC |
+| `remote/token.txt` | Access token (X-Token, required everywhere) |
+| `remote/cert.pem`, `remote/key.pem` | TLS certificate |
 
-## Управление
+## Usage
 
 ```bash
-python3 remote/ctl.py --status        # клиент онлайн? очередь?
-python3 remote/ctl.py "ipconfig"      # выполнить и дождаться вывода
-python3 remote/ctl.py --wait 120 "..."  # ждать дольше 60 с
+python3 remote/ctl.py --status        # client online? queue?
+python3 remote/ctl.py "ipconfig"      # run and wait for output
+python3 remote/ctl.py --wait 120 "..."  # wait longer than 60 s
 ```
 
-## Нюансы
+## Notes
 
-- 443 без root не взять — потому TLS на 8443. Если дать права (setcap или
-  iptables-редирект), можно пересесть на 443, поменяв `FREYD_TLS_PORT`.
-- Клиент выполняет команды через `cmd /c`, таймаут — жёсткого нет (PowerShell).
-- Автозапуск сервера: cron `@reboot` → `start_remote.sh`.
+- Port 443 needs root — that's why TLS lives on 8443. With extra rights (setcap
+  or an iptables redirect) you can move to 443 via `FREYD_TLS_PORT`.
+- Commands run through `cmd /c`, no hard timeout on the PowerShell client.
+- The server autostarts on boot: cron `@reboot` → `start_remote.sh`.

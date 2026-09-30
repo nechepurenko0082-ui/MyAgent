@@ -1,5 +1,7 @@
 # MyAgent
 
+Русский: [README.ru.md](README.ru.md)
+
 A personal Telegram AI agent with a terminal, long-term memory, voice replies and
 its own server body. One agent, one context, many toggles.
 
@@ -22,6 +24,9 @@ systemd user service.
 - **Reminders & schedule** — background loop fires reminders every 30 s
   (`reminder_add`, `reminder_list`, `reminder_delete`), Moscow time.
 - **Web access** — `web_search` and `web_fetch` behind the «Поиск» toggle.
+- **Remote PC control** — run commands on the owner's computer from the server:
+  command queue, output capture, shutdown/restart notifications. TLS with
+  certificate pinning. Details: [remote/README.md](remote/README.md)
 
 ## Toggles
 
@@ -61,6 +66,7 @@ BOT_TOKEN=...
 AITUNNEL_API_KEY=...
 ALLOWED_USER_ID=...
 MODEL_NAME=qwen3.8-flash
+USER_ALIASES=name:id,name:id
 EOF
 
 # 2. Dependencies
@@ -84,6 +90,9 @@ agent.py           # agent loop, tool schemas, API client
 bot.py             # Aiogram bot, toggles, delivery, name resolution
 tools.py           # tool implementations (files, memory, web, voice, reminders)
 phrases.py         # UI strings
+server.py          # remote PC command server (TLS + legacy bridge)
+start_remote.sh    # restart the remote access server
+remote/            # clients, templates and tooling for the remote PC
 system_prompt.txt  # agent persona (git-ignored, personal)
 *.db               # history, states, memory, reminders (git-ignored)
 bin/ffmpeg         # local static ffmpeg copy (git-ignored)
